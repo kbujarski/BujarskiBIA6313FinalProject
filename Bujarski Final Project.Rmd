@@ -1,0 +1,359 @@
+---
+title: "Bujarski Final Project"
+author: "Kevin Bujarski"
+date: "March 7, 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Point Pattern and Area Analysis of Asheville, NC Airbnb listings  
+
+This project will look at Airbnb listings for Asheville, NC.  We will apply spatial interpolation methods and multiple linear regression models to deterine an estimated price of a room type.
+
+### Data Prep
+
+```{r import}
+library(sf)
+library(sp)
+library(maptools)
+library(tidyverse)
+library(ggmap)
+library(jsonlite)
+library(rgdal)
+library(GISTools)
+library(tmap)
+
+asheville <- read.csv(file = "http://data.insideairbnb.com/united-states/nc/asheville/2020-02-29/visualisations/listings.csv")
+
+asheville_polygons <- st_read("http://data.insideairbnb.com/united-states/nc/asheville/2020-02-29/visualisations/neighbourhoods.geojson")
+```  
+
+
+```{r eda}
+head(asheville)
+dim(asheville)
+names(asheville)
+
+class(asheville_polygons)
+#view(asheville_polygons)
+```  
+
+```{r prep}
+asheville_rooms <- data.frame(unique(asheville$room_type))
+
+#view(asheville_rooms)
+
+asheville_entire.homes <- asheville %>% filter (room_type == "Entire home/apt")%>% arrange(neighbourhood)
+
+library(sp)
+coordinates(asheville_entire.homes)<- ~longitude+latitude #transform to SpatialPointsDataFrame
+proj4string(asheville_entire.homes) <- CRS("+init=epsg:4326")
+
+# listings_homes_proj <- spTransform(asheville_entire.homes, CRS("+init=epsg:4326"))
+# proj4string(listings_homes_proj)
+
+
+#Set polygons dataset to spatial
+asheville_sp <- as(asheville_polygons, "Spatial")
+
+#Make sure proj CRS is matching
+asheville_sp_proj <- spTransform(asheville_sp, CRS(proj4string(asheville_entire.homes))) 
+
+
+proj4string(asheville_sp_proj)
+proj4string(asheville_entire.homes)
+```  
+
+## Asheville Airbnb Plot
+
+```{r plots, echo=FALSE}
+par(mar=c(1,1,1,1))
+
+plot(asheville_sp)
+plot(asheville_entire.homes, col="red",add=TRUE)
+```  
+## Spatial Interpolation  
+
+### Proximity Polygons
+
+```{r prox polygon}
+#Proximity Polygons
+require(deldir)
+require(sp)
+
+# Modified Carson Farmer code
+voronoipolygons = function(layer) {
+  crds <- layer@coords
+  z <- deldir(crds[,1], crds[,2])
+  w <- tile.list(z)
+  polys <- vector(mode='list', length=length(w))
+  for (i in seq(along=polys)) {
+    pcrds <- cbind(w[[i]]$x, w[[i]]$y)
+    pcrds <- rbind(pcrds, pcrds[1,])
+    polys[[i]] <- Polygons(list(Polygon(pcrds)),
+                           ID=as.character(i))
+  }
+  SP <- SpatialPolygons(polys)
+  voronoi <- SpatialPolygonsDataFrame(SP, 
+                                      data=data.frame(dummy = seq(length(SP)),
+                                                      row.names=sapply(slot(SP, 'polygons'), 
+                                                                       function(x) slot(x, 'ID'))))
+  proj4string(voronoi) <- CRS(proj4string(layer))
+  return(voronoi)
+}
+
+
+library(gstat)
+library(tmap)
+# Can't get below to work due to error.  Tried replacing x = etc.. in above function with suggested stackexchange article dummy = seq(length(SP)), but didn't work for tmap after that. (https://gis.stackexchange.com/questions/190917/r-voronoi-tesselation-from-long-lat-data)
+asheville.voro <- voronoipolygons(asheville_entire.homes)
+
+tmap_mode('plot')
+fpt <- tm_shape(asheville_entire.homes) + tm_dots(size=0.1)
+fvr <- tm_shape(asheville.voro) + tm_borders()
+tmap_arrange(fpt,fvr)
+
+
+library(gstat)
+library(GISTools)
+tmap_mode('view')
+sh <- shading(breaks=c(50,150,250,350),
+              cols=brewer.pal(5,'Purples'))
+tm_shape(asheville.voro) + tm_fill(col='price',style='fixed',breaks=c(0,50,150,250,350),
+                                alpha=0.6,title='Price Density')
+#### Can't get map to generate.  I've tried removing every single attribute.  I've tried different versions of breaks, and I've tried changing to just tm_fill()  nothing works.
+
+```  
+
+### IDW
+
+```{r idw}
+library(maptools) # Required package
+library(GISTools) # Required package
+library(gstat) # Set up the gstat package
+library(tmap)
+# Define a sample grid then use it as a set of points 
+# to estimate fulmar density via IDW, with alpha=1 (inverse relationship)
+s.grid <- spsample(asheville.voro,type='regular',n=6000)
+idw.est <- gstat::idw(price~1,asheville_entire.homes,
+                      newdata=s.grid,idp=1.0)
+
+# tmap_mode('view')
+# tm_shape(idw.est) + tm_dots(col='var1.pred',border.col=NA,alpha=0.7)
+# tmap_mode('view')
+# idw.grid <- SpatialPixelsDataFrame(idw.est,data.frame(idw.est)) 
+# tm_shape(idw.grid) + tm_raster(col='var1.pred',title='Price')
+# 
+# 
+#How does this compare to when the idp (alpha) = 2.0
+#(which indicates an inverse squared relationship)?
+
+idw.est2 <- gstat::idw(price~1,asheville_entire.homes,
+                       newdata=s.grid,idp=2.0)
+idw.grid2 <- SpatialPixelsDataFrame(idw.est2,data.frame(idw.est2))
+# tmap_mode('view')
+# #levs <- c(0,2,4,6,8,Inf)
+# tm_shape(idw.grid2) +  tm_raster(col='var1.pred',title='Price')
+
+tmap_mode('plot')
+idw1 <- tm_shape(idw.grid) +  tm_raster(col='var1.pred',title='Alpha = 1')
+idw2 <- tm_shape(idw.grid2) +  tm_raster(col='var1.pred',title='Alpha = 2')
+tmap_arrange(idw1,idw2)
+
+# Extract the distinct x and y coordinates of the grid
+# Extract the predicted values and form into a matrix
+# of gridded values
+ux <- unique(coordinates(idw.est)[,1])
+uy <- unique(coordinates(idw.est)[,2])
+predmat <- matrix(idw.est$var1.pred,length(ux),length(uy))
+
+predmat2 <- matrix(idw.est2$var1.pred,length(ux),length(uy))
+par(mfrow=c(1,2),mar=c(0,0,2,0))
+persp(predmat,box=FALSE)
+persp(predmat2,box=FALSE)
+```  
+
+### Trend Surface Analysis
+
+```{r trend surf}
+library(rgdal)
+library(tmap)
+library(raster)
+# Create an empty grid where n is the total number of cells
+grd              <- as.data.frame(spsample(asheville_entire.homes, "regular", n=50000))
+names(grd)       <- c("X", "Y")
+coordinates(grd) <- c("X", "Y")
+gridded(grd)     <- TRUE  # Create SpatialPixel object
+fullgrid(grd)    <- TRUE  # Create SpatialGrid object
+
+# Add P's projection information to the empty grid
+proj4string(grd) <- proj4string(asheville_entire.homes)
+
+# Define the 1st order polynomial equation
+f.1 <- as.formula(price ~ X + Y) 
+
+# Add X and Y to P
+asheville_entire.homes$X <- coordinates(asheville_entire.homes)[,1]
+asheville_entire.homes$Y <- coordinates(asheville_entire.homes)[,2]
+
+# Run the regression model
+lm.1 <- lm( f.1, data=asheville_entire.homes)
+
+# Use the regression model output to interpolate the surface
+dat.1st <- SpatialGridDataFrame(grd, data.frame(var1.pred = predict(lm.1, newdata=grd))) 
+
+# Clip the interpolated raster
+library(raster)
+r   <- raster(dat.1st)
+r.m <- mask(r, asheville_sp)
+
+# Plot the map
+tm_shape(r.m) + 
+  tm_raster(n=7, palette="RdBu", 
+            title="Housing Prices in Asheville") +
+  tm_shape(asheville_entire.homes) + tm_dots(size=0.2) +
+  tm_legend(legend.outside=TRUE)
+
+
+
+# Define the 2nd order polynomial equation
+f.2 <- as.formula(price ~ X + Y + I(X*X)+I(Y*Y) + I(X*Y))
+
+# Add X and Y to P
+asheville_entire.homes$X <- coordinates(asheville_entire.homes)[,1]
+asheville_entire.homes$Y <- coordinates(asheville_entire.homes)[,2]
+
+# Run the regression model
+lm.2 <- lm( f.2, data=asheville_entire.homes)
+
+# Use the regression model output to interpolate the surface
+dat.2nd <- SpatialGridDataFrame(grd, data.frame(var1.pred = predict(lm.2, newdata=grd))) 
+
+# Clip the interpolated raster
+r   <- raster(dat.2nd)
+r.m <- mask(r, asheville_sp)
+
+# Plot the map
+tm_shape(r.m) + 
+  tm_raster(n=10, palette="RdBu",
+            title="Housing Prices in Asheville") +
+  tm_shape(asheville_entire.homes) + tm_dots(size=0.2) +
+  tm_legend(legend.outside=TRUE)
+```  
+
+## Geoweighted Regression Models 1
+
+```{r geoweight 1}
+library(GWmodel)
+
+mean(asheville_entire.homes$price) #mean price
+sd(asheville_entire.homes$price) #standard deviation
+
+#What do the local counterparts look like?
+
+localstats1 <- gwss(asheville_entire.homes, vars = c("price",
+                                          "minimum_nights"), bw=10000) #bandwidth is 50km
+
+head(data.frame(localstats1$SDF))
+
+library(RColorBrewer)
+plot.new()
+quick.map <- function(spdf,var,legend.title,main.title) {
+  x <- spdf@data[,var]
+  cut.vals <- pretty(x)
+  x.cut <- cut(x,cut.vals)
+  cut.levels <- levels(x.cut)
+  cut.band <- match(x.cut,cut.levels)
+  colors <- brewer.pal(length(cut.levels),'Reds')
+  par(mar=c(1,1,1,1))
+  plot(ewoutline,col='grey85')
+  title(main.title)
+  plot(spdf,add=TRUE,col=colors[cut.band],pch=16)
+  legend('topleft',cut.levels,col=colors,pch=16,bty='n',title=legend.title)
+}
+
+plot.new()
+par(mfrow=c(1,2))
+quick.map(localstats1$SDF, "minimum_nights",
+          "100's of $", "Geographically Weighted Mean")
+
+quick.map(localstats1$SDF, "minimum_nights",
+          "100's of $", "Local Standard Deviation")
+```  
+
+## Geoweighted Regression Models 1 cont...
+
+```{r gwr.basic 1}
+
+
+gwr.res <- gwr.basic(price~minimum_nights,
+                     data=asheville_entire.homes,bw=10000, kernel='gaussian')
+
+gwr.res
+
+gwr.res.ad <- gwr.basic(price~minimum_nights,
+                        data=asheville_entire.homes,adaptive=TRUE,bw=100)
+quick.map(gwr.res.ad$SDF,"minimum_nights",
+          "1000's Uk Pounds per Square meter",
+          "Geographically Weighted Regression Coefficient")
+```  
+
+## Geoweighted Regression Models 2
+
+```{r geoweight 2}
+library(GWmodel)
+
+mean(asheville_entire.homes$availability_365) #mean price
+sd(asheville_entire.homes$availability_365) #standard deviation
+
+#What do the local counterparts look like?
+
+localstats1 <- gwss(asheville_entire.homes, vars = c("price",
+                                          "availability_365"), bw=10000) #bandwidth is 50km
+
+head(data.frame(localstats1$SDF))
+
+library(RColorBrewer)
+plot.new()
+quick.map <- function(spdf,var,legend.title,main.title) {
+  x <- spdf@data[,var]
+  cut.vals <- pretty(x)
+  x.cut <- cut(x,cut.vals)
+  cut.levels <- levels(x.cut)
+  cut.band <- match(x.cut,cut.levels)
+  colors <- brewer.pal(length(cut.levels),'Reds')
+  par(mar=c(1,1,1,1))
+  plot(ewoutline,col='grey85')
+  title(main.title)
+  plot(spdf,add=TRUE,col=colors[cut.band],pch=16)
+  legend('topleft',cut.levels,col=colors,pch=16,bty='n',title=legend.title)
+}
+
+plot.new()
+par(mfrow=c(1,2))
+quick.map(localstats1$SDF, "availability_365",
+          "100's of $", "Geographically Weighted Mean")
+
+quick.map(localstats1$SDF, "availability_365",
+          "100's of $", "Local Standard Deviation")
+```  
+
+## Geoweighted Regression Models 2 cont...
+
+```{r gwr.basic 2}
+
+
+gwr.res <- gwr.basic(price~availability_365,
+                     data=asheville_entire.homes,bw=10000, kernel='gaussian')
+
+gwr.res
+
+gwr.res.ad <- gwr.basic(price~availability_365,
+                        data=asheville_entire.homes,adaptive=TRUE,bw=100)
+quick.map(gwr.res.ad$SDF,"availability_365",
+          "1000's Uk Pounds per Square meter",
+          "Geographically Weighted Regression Coefficient")
+```
